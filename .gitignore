@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Generated conversion outputs and large source documents
+*.epub
+*.pdf
+
+# Temporary files
+*.tmp
+*.temp
+*.log

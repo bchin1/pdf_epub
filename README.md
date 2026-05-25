@@ -15,6 +15,7 @@ This converter is built for documents that may contain thousands of pages, inclu
 - Processes one PDF page at a time to keep memory usage low
 - Deduplicates repeated embedded images by PDF object ID
 - Builds the EPUB archive directly, avoiding large in-memory book objects
+- Shows a terminal progress bar during conversion
 
 ## Important limitation
 
@@ -42,18 +43,35 @@ python pdf_to_epub.py input.pdf output.epub \
   --pages-per-chapter 75
 ```
 
+During conversion, the script shows page progress and an ETA:
+
+```text
+Converting pages: [############--------] 4200/7000 (60.00%) ETA 03:12
+Packaging EPUB archive...
+```
+
+To disable progress output, use:
+
+```bash
+python pdf_to_epub.py input.pdf output.epub --no-progress
+```
+
 ## How chapter splitting works
 
-If the source PDF has a usable outline / bookmark tree, the converter uses its
-top-level bookmarks as EPUB chapters. For example, a PDF outline such as:
+If the source PDF has a usable outline / bookmark tree, the converter chooses
+the outline level that most likely represents real chapters. This matters for
+books that use top-level entries as containers like volumes and second-level
+entries as chapters. For example, a PDF outline such as:
 
-- Introduction — page 1
-- Part I — page 23
-- Part II — page 240
+- Volume 1 — page 1
+  - Chapter 1 — page 1
+  - Chapter 2 — page 15
+  - Chapter 3 — page 28
+- Volume 2 — page 240
 
-becomes matching EPUB chapters with those titles and page ranges.
+becomes chapter-level EPUB entries instead of one giant chapter per volume.
 
-If the PDF has no usable top-level bookmarks, the converter falls back to fixed
+If the PDF has no usable outline bookmarks, the converter falls back to fixed
 page-count splitting. By default, that means one EPUB chapter for every 50 PDF
 pages:
 
@@ -80,6 +98,10 @@ That means memory usage is driven mostly by the currently loaded PDF page and an
 
 - Text is reflowable XHTML, so it remains selectable and searchable.
 - Images are appended within the page section where they were discovered.
+- Original PDF page boundaries are kept as hidden XHTML anchors, but visible
+  `Page N` headings are not inserted into the reading flow.
+- Pages with no extractable text are recorded in a `.log` file next to the EPUB
+  instead of being inserted into the book as placeholder text.
 - Layout will not exactly match the original PDF; PDFs are fixed-layout documents, while EPUB is typically reflowable.
 - Repeated images such as logos are stored once and reused.
 

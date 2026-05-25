@@ -24,7 +24,9 @@ import argparse
 import html
 import mimetypes
 import re
+import sys
 import tempfile
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -37,6 +39,8 @@ import fitz  # PyMuPDF
 # EPUB readers expect XHTML/XML-safe IDs. Replacing unsupported characters keeps
 # generated identifiers valid even when file names contain spaces or punctuation.
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_CHAPTER_TITLE_RE = re.compile(r"\bchapter\b", re.IGNORECASE)
+_VISIBLE_PAGE_MARKER_RE = re.compile(r"page\s+\d+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,67 @@ class ImageRecord:
     xref: int
     relative_path: str
     media_type: str
+
+
+class ProgressBar:
+    """Tiny dependency-free terminal progress bar for long conversions.
+
+    A 7,000+ page PDF can run for a while, so the command-line tool should make
+    forward progress visible. The bar updates in-place on interactive terminals
+    and keeps only a few counters in memory.
+    """
+
+    def __init__(self, total: int, label: str = "Converting", width: int = 32) -> None:
+        self.total = max(total, 1)
+        self.label = label
+        self.width = width
+        self.current = 0
+        self.started_at = time.monotonic()
+        self._last_rendered = ""
+
+    def update(self, current: int) -> None:
+        """Render the bar for the given completed page count."""
+
+        self.current = min(max(current, 0), self.total)
+        percent = self.current / self.total
+        filled = int(self.width * percent)
+        bar = "#" * filled + "-" * (self.width - filled)
+
+        elapsed = max(time.monotonic() - self.started_at, 0.001)
+        pages_per_second = self.current / elapsed
+        if self.current and pages_per_second > 0:
+            remaining_pages = self.total - self.current
+            eta_seconds = int(remaining_pages / pages_per_second)
+            eta = format_duration(eta_seconds)
+        else:
+            eta = "--:--"
+
+        message = (
+            f"\r{self.label}: [{bar}] {self.current}/{self.total} "
+            f"({percent:6.2%}) ETA {eta}"
+        )
+
+        # Pad with spaces so a shorter later message fully overwrites a longer
+        # previous one on the same terminal line.
+        padding = " " * max(0, len(self._last_rendered) - len(message))
+        print(message + padding, end="", file=sys.stderr, flush=True)
+        self._last_rendered = message
+
+    def finish(self) -> None:
+        """Complete the progress line and move subsequent output below it."""
+
+        self.update(self.total)
+        print(file=sys.stderr, flush=True)
+
+
+def format_duration(seconds: int) -> str:
+    """Format an ETA as MM:SS or HH:MM:SS for long conversions."""
+
+    minutes, seconds = divmod(max(seconds, 0), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 def xml_escape(value: str) -> str:
@@ -108,15 +173,50 @@ def chapter_title(chapter_number: int, start_page: int, end_page: int) -> str:
     return f"Chapter {chapter_number} (pages {start_page}-{end_page})"
 
 
+def choose_outline_level(outline_entries: list[tuple[int, str, int]]) -> int | None:
+    """Choose the PDF outline level that most likely represents real chapters.
+
+    Many long books use level 1 for containers such as "Volume 1" and level 2
+    for actual chapters. Other PDFs put chapters directly at level 1. This
+    heuristic prefers the level with the most chapter-like titles, then falls
+    back to the level with the most entries. That gives better results for
+    novels while still handling ordinary single-level outlines.
+    """
+
+    if not outline_entries:
+        return None
+
+    levels = sorted({level for level, _title, _page in outline_entries})
+    chapter_like_counts = {
+        level: sum(
+            1
+            for entry_level, title, _page in outline_entries
+            if entry_level == level and _CHAPTER_TITLE_RE.search(title)
+        )
+        for level in levels
+    }
+    best_chapter_level = max(
+        levels,
+        key=lambda level: (chapter_like_counts[level], -level),
+    )
+    if chapter_like_counts[best_chapter_level] > 0:
+        return best_chapter_level
+
+    entry_counts = {
+        level: sum(1 for entry_level, _title, _page in outline_entries if entry_level == level)
+        for level in levels
+    }
+    return max(levels, key=lambda level: (entry_counts[level], -level))
+
+
 def build_outline_chapter_specs(
     document: fitz.Document,
 ) -> list[ChapterSpec]:
-    """Build chapter boundaries from top-level PDF outline entries when possible.
+    """Build chapter boundaries from the best available PDF outline level.
 
     PyMuPDF returns TOC entries as ``[level, title, page, ...]`` where pages are
-    1-based. We intentionally use only level-1 entries as EPUB chapters:
-    lower-level entries are often sections/subsections and would produce many
-    tiny XHTML files if treated as full chapters.
+    1-based. The useful chapter level varies by PDF: some use level 1 for
+    chapters, while others use level 1 for volumes and level 2 for chapters.
 
     Invalid, duplicate, or non-increasing start pages are ignored because they
     cannot define a clean contiguous reading order. If the first usable outline
@@ -124,43 +224,58 @@ def build_outline_chapter_specs(
     lost before the first named chapter.
     """
 
-    top_level_entries: list[tuple[str, int]] = []
-    last_start_page = 0
+    outline_entries: list[tuple[int, str, int]] = []
 
     for entry in document.get_toc():
         if len(entry) < 3:
             continue
 
         level, title, page = entry[:3]
-        if level != 1 or not isinstance(page, int):
+        if not isinstance(level, int) or not isinstance(page, int):
             continue
         if not 1 <= page <= document.page_count:
+            continue
+
+        cleaned_title = str(title).strip()
+        if not cleaned_title:
+            continue
+
+        outline_entries.append((level, cleaned_title, page))
+
+    chosen_level = choose_outline_level(outline_entries)
+    if chosen_level is None:
+        return []
+
+    selected_entries: list[tuple[str, int]] = []
+    last_start_page = 0
+
+    for level, title, page in outline_entries:
+        if level != chosen_level:
             continue
         if page <= last_start_page:
             continue
 
-        cleaned_title = str(title).strip() or f"Chapter {len(top_level_entries) + 1}"
-        top_level_entries.append((cleaned_title, page))
+        selected_entries.append((title, page))
         last_start_page = page
 
-    if not top_level_entries:
+    if not selected_entries:
         return []
 
     specs: list[ChapterSpec] = []
 
-    if top_level_entries[0][1] > 1:
+    if selected_entries[0][1] > 1:
         specs.append(
             ChapterSpec(
                 title="Front Matter",
                 start_page=1,
-                end_page=top_level_entries[0][1] - 1,
+                end_page=selected_entries[0][1] - 1,
             )
         )
 
-    for index, (title, start_page) in enumerate(top_level_entries):
+    for index, (title, start_page) in enumerate(selected_entries):
         next_start_page = (
-            top_level_entries[index + 1][1]
-            if index + 1 < len(top_level_entries)
+            selected_entries[index + 1][1]
+            if index + 1 < len(selected_entries)
             else document.page_count + 1
         )
         specs.append(
@@ -239,6 +354,7 @@ def write_page_xhtml(
     page_number: int,
     image_records: dict[int, ImageRecord],
     images_dir: Path,
+    log_handle: TextIO,
 ) -> int:
     """Write one PDF page into the current XHTML chapter.
 
@@ -249,17 +365,32 @@ def write_page_xhtml(
 
     raw_text = page.get_text("text", sort=True)
     paragraphs = normalize_paragraphs(raw_text)
+    content_paragraphs = [
+        paragraph for paragraph in paragraphs if not _VISIBLE_PAGE_MARKER_RE.fullmatch(paragraph)
+    ]
 
-    chapter_handle.write(f'  <section class="page" id="page-{page_number}">\n')
-    chapter_handle.write(f"    <h2>Page {page_number}</h2>\n")
+    # Keep an XHTML anchor for the original PDF page without rendering a visible
+    # "Page N" heading in the EPUB. Visible page headings interrupt normal
+    # reading flow, especially for novels or documents whose extracted text
+    # already includes its own page numbers.
+    chapter_handle.write(
+        f'  <section class="page" id="page-{page_number}" aria-label="PDF page {page_number}">\n'
+    )
 
-    if paragraphs:
-        for paragraph in paragraphs:
+    removed_page_markers = len(paragraphs) - len(content_paragraphs)
+    if removed_page_markers:
+        log_handle.write(
+            f"Page {page_number}: removed {removed_page_markers} visible page marker(s).\n"
+        )
+
+    if content_paragraphs:
+        for paragraph in content_paragraphs:
             chapter_handle.write(f"    <p>{xml_escape(paragraph)}</p>\n")
     else:
-        # Keeping a visible placeholder is more honest than silently omitting a
-        # page when the PDF has no extractable text layer.
-        chapter_handle.write('    <p class="no-text">[No extractable text on this page]</p>\n')
+        # Diagnostics belong in the conversion log, not in the EPUB's reading
+        # flow. The empty section still preserves the original page anchor for
+        # navigation/debugging without showing placeholder text to readers.
+        log_handle.write(f"Page {page_number}: no extractable text on this page.\n")
 
     # get_images() lists embedded raster images referenced by this page. The xref
     # is a document-wide object number, so repeated logos/backgrounds can be
@@ -397,11 +528,10 @@ def write_epub_archive(
     )
     (styles_dir / "style.css").write_text(
         """body { font-family: serif; line-height: 1.45; }
-.page { margin-bottom: 2rem; }
+.page { margin: 0; padding: 0; }
 h1, h2 { page-break-after: avoid; }
 figure { margin: 1rem 0; text-align: center; }
 img { max-width: 100%; height: auto; }
-.no-text { color: #666; font-style: italic; }
 """,
         encoding="utf-8",
     )
@@ -421,6 +551,7 @@ def convert_pdf_to_epub(
     output_epub: Path,
     title: str | None = None,
     pages_per_chapter: int = 50,
+    show_progress: bool = True,
 ) -> tuple[int, int, int]:
     """Convert a PDF to EPUB and return (pages, chapters, extracted_images)."""
 
@@ -429,6 +560,7 @@ def convert_pdf_to_epub(
 
     resolved_title = title or input_pdf.stem
     output_epub.parent.mkdir(parents=True, exist_ok=True)
+    log_path = output_epub.with_suffix(".log")
 
     # A TemporaryDirectory lets us stream intermediate files to disk and ensures
     # they disappear even if conversion fails halfway through.
@@ -445,8 +577,15 @@ def convert_pdf_to_epub(
 
         # PyMuPDF lazily loads page content as pages are requested, which keeps
         # conversion practical for documents containing many thousands of pages.
-        with fitz.open(input_pdf) as document:
+        with fitz.open(input_pdf) as document, log_path.open("w", encoding="utf-8") as log_handle:
+            log_handle.write(f"Input PDF: {input_pdf}\n")
+            log_handle.write(f"Output EPUB: {output_epub}\n")
+            log_handle.write(f"Total pages: {document.page_count}\n\n")
+
             total_pages = document.page_count
+            progress = ProgressBar(total_pages, label="Converting pages") if show_progress else None
+            converted_pages = 0
+
             chapter_specs = build_outline_chapter_specs(document)
             if not chapter_specs:
                 chapter_specs = build_fixed_size_chapter_specs(total_pages, pages_per_chapter)
@@ -474,15 +613,24 @@ def convert_pdf_to_epub(
                         page_number,
                         image_records,
                         images_dir,
+                        log_handle,
                     )
+                    converted_pages += 1
+                    if progress is not None:
+                        progress.update(converted_pages)
                 close_chapter_file(chapter_handle)
 
+            if progress is not None:
+                progress.finish()
+
+        if show_progress:
+            print("Packaging EPUB archive...", file=sys.stderr)
         write_epub_archive(output_epub, staging_root, resolved_title, chapters, image_records)
 
     if total_text_characters == 0:
         print(
             "Warning: no selectable text was extracted. "
-            "The PDF may be scanned and may need OCR before conversion."
+            f"The PDF may be scanned and may need OCR before conversion. See log: {log_path}"
         )
 
     return total_pages, len(chapters), len(image_records)
@@ -503,6 +651,11 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Number of PDF pages per EPUB chapter (default: 50)",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the terminal progress bar",
+    )
     return parser.parse_args()
 
 
@@ -521,6 +674,7 @@ def main() -> None:
         output_epub=args.output_epub,
         title=args.title,
         pages_per_chapter=args.pages_per_chapter,
+        show_progress=not args.no_progress,
     )
     print(
         f"Converted {pages} pages into {chapters} chapters, "
