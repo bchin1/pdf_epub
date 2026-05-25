@@ -10,7 +10,8 @@ This converter is built for documents that may contain thousands of pages, inclu
 
 - Preserves extractable PDF text as selectable EPUB text
 - Extracts embedded raster images and includes them in the EPUB
-- Splits the book into chapters by configurable page count
+- Uses existing top-level PDF bookmarks as EPUB chapters when available
+- Falls back to configurable page-count chapter splitting when no usable outline exists
 - Processes one PDF page at a time to keep memory usage low
 - Deduplicates repeated embedded images by PDF object ID
 - Builds the EPUB archive directly, avoiding large in-memory book objects
@@ -43,13 +44,24 @@ python pdf_to_epub.py input.pdf output.epub \
 
 ## How chapter splitting works
 
-By default, the converter creates one EPUB chapter for every 50 PDF pages:
+If the source PDF has a usable outline / bookmark tree, the converter uses its
+top-level bookmarks as EPUB chapters. For example, a PDF outline such as:
+
+- Introduction — page 1
+- Part I — page 23
+- Part II — page 240
+
+becomes matching EPUB chapters with those titles and page ranges.
+
+If the PDF has no usable top-level bookmarks, the converter falls back to fixed
+page-count splitting. By default, that means one EPUB chapter for every 50 PDF
+pages:
 
 - `chapter-00001.xhtml` contains pages 1-50
 - `chapter-00002.xhtml` contains pages 51-100
 - and so on
 
-You can change the split size with `--pages-per-chapter`. Smaller chapters may feel more responsive in some EPUB readers; larger chapters produce fewer files.
+You can change the fallback split size with `--pages-per-chapter`. Smaller chapters may feel more responsive in some EPUB readers; larger chapters produce fewer files.
 
 ## Memory strategy for huge PDFs
 
@@ -83,4 +95,4 @@ That means memory usage is driven mostly by the currently loaded PDF page and an
 python pdf_to_epub.py giant-reference.pdf giant-reference.epub --pages-per-chapter 100
 ```
 
-For a 7,000-page PDF and `--pages-per-chapter 100`, the output EPUB will contain 70 chapter XHTML files.
+For a 7,000-page PDF with no usable outline and `--pages-per-chapter 100`, the output EPUB will contain 70 chapter XHTML files.

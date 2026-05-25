@@ -53,6 +53,15 @@ class ChapterRecord:
 
 
 @dataclass(frozen=True)
+class ChapterSpec:
+    """Planned chapter boundary before XHTML files are written."""
+
+    title: str
+    start_page: int
+    end_page: int
+
+
+@dataclass(frozen=True)
 class ImageRecord:
     """Metadata for an extracted PDF image stored on disk."""
 
@@ -97,6 +106,91 @@ def chapter_title(chapter_number: int, start_page: int, end_page: int) -> str:
     """Create a predictable chapter title from the covered page range."""
 
     return f"Chapter {chapter_number} (pages {start_page}-{end_page})"
+
+
+def build_outline_chapter_specs(
+    document: fitz.Document,
+) -> list[ChapterSpec]:
+    """Build chapter boundaries from top-level PDF outline entries when possible.
+
+    PyMuPDF returns TOC entries as ``[level, title, page, ...]`` where pages are
+    1-based. We intentionally use only level-1 entries as EPUB chapters:
+    lower-level entries are often sections/subsections and would produce many
+    tiny XHTML files if treated as full chapters.
+
+    Invalid, duplicate, or non-increasing start pages are ignored because they
+    cannot define a clean contiguous reading order. If the first usable outline
+    entry begins after page 1, a "Front Matter" chapter is added so no pages are
+    lost before the first named chapter.
+    """
+
+    top_level_entries: list[tuple[str, int]] = []
+    last_start_page = 0
+
+    for entry in document.get_toc():
+        if len(entry) < 3:
+            continue
+
+        level, title, page = entry[:3]
+        if level != 1 or not isinstance(page, int):
+            continue
+        if not 1 <= page <= document.page_count:
+            continue
+        if page <= last_start_page:
+            continue
+
+        cleaned_title = str(title).strip() or f"Chapter {len(top_level_entries) + 1}"
+        top_level_entries.append((cleaned_title, page))
+        last_start_page = page
+
+    if not top_level_entries:
+        return []
+
+    specs: list[ChapterSpec] = []
+
+    if top_level_entries[0][1] > 1:
+        specs.append(
+            ChapterSpec(
+                title="Front Matter",
+                start_page=1,
+                end_page=top_level_entries[0][1] - 1,
+            )
+        )
+
+    for index, (title, start_page) in enumerate(top_level_entries):
+        next_start_page = (
+            top_level_entries[index + 1][1]
+            if index + 1 < len(top_level_entries)
+            else document.page_count + 1
+        )
+        specs.append(
+            ChapterSpec(
+                title=title,
+                start_page=start_page,
+                end_page=next_start_page - 1,
+            )
+        )
+
+    return specs
+
+
+def build_fixed_size_chapter_specs(
+    total_pages: int,
+    pages_per_chapter: int,
+) -> list[ChapterSpec]:
+    """Build fallback chapter boundaries when a PDF has no usable outline."""
+
+    specs: list[ChapterSpec] = []
+    for start_page in range(1, total_pages + 1, pages_per_chapter):
+        end_page = min(start_page + pages_per_chapter - 1, total_pages)
+        specs.append(
+            ChapterSpec(
+                title=chapter_title(len(specs) + 1, start_page, end_page),
+                start_page=start_page,
+                end_page=end_page,
+            )
+        )
+    return specs
 
 
 def open_chapter_file(
@@ -353,44 +447,34 @@ def convert_pdf_to_epub(
         # conversion practical for documents containing many thousands of pages.
         with fitz.open(input_pdf) as document:
             total_pages = document.page_count
-            chapter_handle: TextIO | None = None
+            chapter_specs = build_outline_chapter_specs(document)
+            if not chapter_specs:
+                chapter_specs = build_fixed_size_chapter_specs(total_pages, pages_per_chapter)
 
-            for zero_based_index in range(total_pages):
-                page_number = zero_based_index + 1
-
-                # Start a new chapter every N pages and close the previous file
-                # immediately so no completed chapter remains open in memory.
-                if zero_based_index % pages_per_chapter == 0:
-                    if chapter_handle is not None:
-                        close_chapter_file(chapter_handle)
-
-                    chapter_number = len(chapters) + 1
-                    start_page = page_number
-                    end_page = min(page_number + pages_per_chapter - 1, total_pages)
-                    title_for_chapter = chapter_title(chapter_number, start_page, end_page)
-                    relative_path = f"text/chapter-{chapter_number:05d}.xhtml"
-                    chapter_path = staging_root / "OEBPS" / relative_path
-
-                    chapters.append(
-                        ChapterRecord(
-                            number=chapter_number,
-                            title=title_for_chapter,
-                            relative_path=relative_path,
-                        )
+            # Work chapter-by-chapter but still process only one PDF page at a
+            # time. Completed XHTML files are closed immediately, preserving the
+            # low-memory behavior while allowing real PDF chapter boundaries.
+            for chapter_number, spec in enumerate(chapter_specs, start=1):
+                relative_path = f"text/chapter-{chapter_number:05d}.xhtml"
+                chapter_path = staging_root / "OEBPS" / relative_path
+                chapters.append(
+                    ChapterRecord(
+                        number=chapter_number,
+                        title=spec.title,
+                        relative_path=relative_path,
                     )
-                    chapter_handle = open_chapter_file(chapter_path, title_for_chapter)
-
-                page = document.load_page(zero_based_index)
-                assert chapter_handle is not None
-                total_text_characters += write_page_xhtml(
-                    chapter_handle,
-                    page,
-                    page_number,
-                    image_records,
-                    images_dir,
                 )
 
-            if chapter_handle is not None:
+                chapter_handle = open_chapter_file(chapter_path, spec.title)
+                for page_number in range(spec.start_page, spec.end_page + 1):
+                    page = document.load_page(page_number - 1)
+                    total_text_characters += write_page_xhtml(
+                        chapter_handle,
+                        page,
+                        page_number,
+                        image_records,
+                        images_dir,
+                    )
                 close_chapter_file(chapter_handle)
 
         write_epub_archive(output_epub, staging_root, resolved_title, chapters, image_records)
