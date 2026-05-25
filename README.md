@@ -12,6 +12,10 @@ This converter is built for documents that may contain thousands of pages, inclu
 - Extracts embedded raster images and includes them in the EPUB
 - Uses existing top-level PDF bookmarks as EPUB chapters when available
 - Falls back to configurable page-count chapter splitting when no usable outline exists
+- Adds clickable chapter links at the beginning of the EPUB and inside front
+  matter when the PDF has pages before the first chapter
+- Suppresses duplicate plain-text TOC paragraphs from front matter after
+  generating linked chapter navigation
 - Processes one PDF page at a time to keep memory usage low
 - Deduplicates repeated embedded images by PDF object ID
 - Builds the EPUB archive directly, avoiding large in-memory book objects

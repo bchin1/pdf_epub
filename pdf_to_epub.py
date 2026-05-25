@@ -41,6 +41,7 @@ import fitz  # PyMuPDF
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _CHAPTER_TITLE_RE = re.compile(r"\bchapter\b", re.IGNORECASE)
 _VISIBLE_PAGE_MARKER_RE = re.compile(r"page\s+\d+", re.IGNORECASE)
+PRE_CHAPTER_TITLE = "Cover and Contents"
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,26 @@ def normalize_paragraphs(raw_text: str) -> list[str]:
     return paragraphs
 
 
+def is_probable_toc_paragraph(paragraph: str) -> bool:
+    """Return True when a paragraph looks like a generated PDF TOC listing.
+
+    Some PDFs contain dozens of front-matter pages where the table of contents
+    has been flattened into plain text, for example:
+
+    ``1. Chapter 1 2. Chapter 2 3. Chapter 3 ...``
+
+    Once we generate real EPUB links, keeping that extracted plain-text TOC
+    creates a duplicate non-clickable list. The heuristic is intentionally
+    conservative and is only used for front matter.
+    """
+
+    chapter_mentions = len(re.findall(r"\bchapter\s+\d+", paragraph, re.IGNORECASE))
+    numbered_items = len(re.findall(r"(?:^|\s)\d+\.\s+", paragraph))
+    has_volume = re.search(r"\bvolume\s+\d+", paragraph, re.IGNORECASE) is not None
+
+    return chapter_mentions >= 3 or (has_volume and chapter_mentions >= 1 and numbered_items >= 2)
+
+
 def chapter_title(chapter_number: int, start_page: int, end_page: int) -> str:
     """Create a predictable chapter title from the covered page range."""
 
@@ -220,8 +241,8 @@ def build_outline_chapter_specs(
 
     Invalid, duplicate, or non-increasing start pages are ignored because they
     cannot define a clean contiguous reading order. If the first usable outline
-    entry begins after page 1, a "Front Matter" chapter is added so no pages are
-    lost before the first named chapter.
+    entry begins after page 1, a "Cover and Contents" chapter is added so no
+    pages are lost before the first named chapter.
     """
 
     outline_entries: list[tuple[int, str, int]] = []
@@ -266,7 +287,7 @@ def build_outline_chapter_specs(
     if selected_entries[0][1] > 1:
         specs.append(
             ChapterSpec(
-                title="Front Matter",
+                title=PRE_CHAPTER_TITLE,
                 start_page=1,
                 end_page=selected_entries[0][1] - 1,
             )
@@ -355,6 +376,7 @@ def write_page_xhtml(
     image_records: dict[int, ImageRecord],
     images_dir: Path,
     log_handle: TextIO,
+    suppress_toc_paragraphs: bool = False,
 ) -> int:
     """Write one PDF page into the current XHTML chapter.
 
@@ -365,9 +387,18 @@ def write_page_xhtml(
 
     raw_text = page.get_text("text", sort=True)
     paragraphs = normalize_paragraphs(raw_text)
-    content_paragraphs = [
-        paragraph for paragraph in paragraphs if not _VISIBLE_PAGE_MARKER_RE.fullmatch(paragraph)
-    ]
+    content_paragraphs: list[str] = []
+    removed_page_markers = 0
+    removed_toc_paragraphs = 0
+
+    for paragraph in paragraphs:
+        if _VISIBLE_PAGE_MARKER_RE.fullmatch(paragraph):
+            removed_page_markers += 1
+            continue
+        if suppress_toc_paragraphs and is_probable_toc_paragraph(paragraph):
+            removed_toc_paragraphs += 1
+            continue
+        content_paragraphs.append(paragraph)
 
     # Keep an XHTML anchor for the original PDF page without rendering a visible
     # "Page N" heading in the EPUB. Visible page headings interrupt normal
@@ -377,10 +408,13 @@ def write_page_xhtml(
         f'  <section class="page" id="page-{page_number}" aria-label="PDF page {page_number}">\n'
     )
 
-    removed_page_markers = len(paragraphs) - len(content_paragraphs)
     if removed_page_markers:
         log_handle.write(
             f"Page {page_number}: removed {removed_page_markers} visible page marker(s).\n"
+        )
+    if removed_toc_paragraphs:
+        log_handle.write(
+            f"Page {page_number}: removed {removed_toc_paragraphs} duplicate TOC paragraph(s).\n"
         )
 
     if content_paragraphs:
@@ -449,6 +483,70 @@ def build_nav_document(title: str, chapters: Iterable[ChapterRecord]) -> str:
 """
 
 
+def build_reading_toc_document(title: str, chapters: Iterable[ChapterRecord]) -> str:
+    """Create a visible in-book table of contents with chapter links.
+
+    EPUB readers expose ``nav.xhtml`` through their own table-of-contents UI,
+    but many readers do not show that navigation document as the first readable
+    page. This XHTML file is added to the spine before the book chapters so the
+    EPUB opens with a clickable chapter list inside the reading flow.
+    """
+
+    items = "\n".join(
+        '      <li><a href="{href}">{title}</a></li>'.format(
+            # This file lives in OEBPS/text/, alongside the chapter XHTML files,
+            # so links should be relative to that same directory.
+            href=xml_escape(Path(ch.relative_path).name),
+            title=xml_escape(ch.title),
+        )
+        for ch in chapters
+    )
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+<head>
+  <title>{xml_escape(title)} - Contents</title>
+  <link rel="stylesheet" type="text/css" href="../styles/style.css"/>
+</head>
+<body>
+  <section class="generated-toc">
+    <h1>Contents</h1>
+    <ul>
+{items}
+    </ul>
+  </section>
+</body>
+</html>
+"""
+
+
+def write_inline_chapter_links(
+    chapter_handle: TextIO,
+    chapters: Iterable[ChapterRecord],
+    heading: str = "Chapter Links",
+) -> None:
+    """Write a clickable chapter list inside an existing chapter document.
+
+    This is especially useful for PDFs with front matter: Apple Books may open
+    the front-matter chapter first, so putting links directly there makes the
+    generated navigation visible where the reader lands.
+    """
+
+    chapter_handle.write('  <section class="generated-toc front-matter-links">\n')
+    chapter_handle.write(f"    <h2>{xml_escape(heading)}</h2>\n")
+    chapter_handle.write("    <ul>\n")
+    for chapter in chapters:
+        if chapter.title == PRE_CHAPTER_TITLE:
+            continue
+        chapter_handle.write(
+            '      <li><a href="{href}">{title}</a></li>\n'.format(
+                href=xml_escape(Path(chapter.relative_path).name),
+                title=xml_escape(chapter.title),
+            )
+        )
+    chapter_handle.write("    </ul>\n")
+    chapter_handle.write("  </section>\n")
+
+
 def build_content_opf(
     title: str,
     book_uuid: str,
@@ -479,10 +577,12 @@ def build_content_opf(
   <manifest>
     <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
     <item id="style" href="styles/style.css" media-type="text/css"/>
+    <item id="reading-toc" href="text/contents.xhtml" media-type="application/xhtml+xml"/>
 {chapter_manifest}
 {image_manifest}
   </manifest>
   <spine>
+    <itemref idref="reading-toc"/>
 {spine}
   </spine>
 </package>
@@ -522,6 +622,10 @@ def write_epub_archive(
         encoding="utf-8",
     )
     (oebps / "nav.xhtml").write_text(build_nav_document(title, chapters), encoding="utf-8")
+    (oebps / "text" / "contents.xhtml").write_text(
+        build_reading_toc_document(title, chapters),
+        encoding="utf-8",
+    )
     (oebps / "content.opf").write_text(
         build_content_opf(title, book_uuid, chapters, image_records.values()),
         encoding="utf-8",
@@ -529,6 +633,8 @@ def write_epub_archive(
     (styles_dir / "style.css").write_text(
         """body { font-family: serif; line-height: 1.45; }
 .page { margin: 0; padding: 0; }
+.generated-toc ul { list-style: none; padding-left: 0; }
+.generated-toc li { margin: 0.35rem 0; }
 h1, h2 { page-break-after: avoid; }
 figure { margin: 1rem 0; text-align: center; }
 img { max-width: 100%; height: auto; }
@@ -590,21 +696,24 @@ def convert_pdf_to_epub(
             if not chapter_specs:
                 chapter_specs = build_fixed_size_chapter_specs(total_pages, pages_per_chapter)
 
+            chapters = [
+                ChapterRecord(
+                    number=chapter_number,
+                    title=spec.title,
+                    relative_path=f"text/chapter-{chapter_number:05d}.xhtml",
+                )
+                for chapter_number, spec in enumerate(chapter_specs, start=1)
+            ]
+
             # Work chapter-by-chapter but still process only one PDF page at a
             # time. Completed XHTML files are closed immediately, preserving the
             # low-memory behavior while allowing real PDF chapter boundaries.
-            for chapter_number, spec in enumerate(chapter_specs, start=1):
-                relative_path = f"text/chapter-{chapter_number:05d}.xhtml"
-                chapter_path = staging_root / "OEBPS" / relative_path
-                chapters.append(
-                    ChapterRecord(
-                        number=chapter_number,
-                        title=spec.title,
-                        relative_path=relative_path,
-                    )
-                )
-
+            for chapter, spec in zip(chapters, chapter_specs):
+                chapter_path = staging_root / "OEBPS" / chapter.relative_path
                 chapter_handle = open_chapter_file(chapter_path, spec.title)
+                if chapter.title == PRE_CHAPTER_TITLE:
+                    write_inline_chapter_links(chapter_handle, chapters)
+
                 for page_number in range(spec.start_page, spec.end_page + 1):
                     page = document.load_page(page_number - 1)
                     total_text_characters += write_page_xhtml(
@@ -614,6 +723,7 @@ def convert_pdf_to_epub(
                         image_records,
                         images_dir,
                         log_handle,
+                        suppress_toc_paragraphs=chapter.title == PRE_CHAPTER_TITLE,
                     )
                     converted_pages += 1
                     if progress is not None:
